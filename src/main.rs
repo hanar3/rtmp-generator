@@ -1,4 +1,5 @@
 #![allow(unused)]
+use futures_util::StreamExt as _;
 use gstreamer::{
     prelude::{ElementExt, ElementExtManual, GstBinExtManual, PadExt},
     Caps, Element, ElementFactory, Pipeline,
@@ -24,6 +25,14 @@ const VIDEO_WIDTH: &str = "1280";
 const VIDEO_HEIGHT: &str = "720";
 const VIDEO_FPS: &str = "30/1";
 const VIDEO_MAX_BUFFERS: i32 = 10;
+const CHANNELS: [&str; 5] = [
+    "return-video-feed",
+    "return-audio-feed-1",
+    "return-audio-feed-2",
+    "return-audio-feed-3",
+    "return-audio-feed-5",
+];
+
 struct GstVideo {
     appsrc: Element,
     queue: Element,
@@ -192,16 +201,36 @@ fn setup_gst() -> Result<Core, anyhow::Error> {
     })
 }
 
-fn main() {
-    let core = setup_gst().unwrap();
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
+    let _ = tokio::spawn(async {
+        let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+        let mut pubsub_conn = client.get_async_pubsub().await.unwrap();
 
-    std::thread::spawn(process_video);
+        // let _: () = pubsub_conn.subscribe("return-video-feed").await.unwrap();
+        let _: () = pubsub_conn.subscribe(&CHANNELS).await.unwrap();
 
-    for i in 0..AUDIO_POOLS {
-        std::thread::spawn(move || {
-            process_audio(i);
-        });
-    }
+        let mut pubsub_stream = pubsub_conn.on_message();
 
-    println!("Hello, world!");
+        loop {
+            let channel = pubsub_stream
+                .next()
+                .await
+                .unwrap()
+                .get_channel_name()
+                .to_string();
+            let pubsub_msg: String = pubsub_stream.next().await.unwrap().get_payload().unwrap();
+
+            if channel == "return-video-feed" {
+                println!("Video received, {}", channel);
+            }
+
+            if channel.starts_with("return-audio-feed") {
+                println!("audio received {}", channel);
+            }
+        }
+    })
+    .await;
+
+    Ok(())
 }
