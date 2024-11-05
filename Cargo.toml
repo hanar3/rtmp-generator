@@ -1,0 +1,12 @@
+[package]
+name = "rtmp-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.89"
+derive_more = { version = "1.0.0", features=["full"] }
+glib = "0.20.4"
+gstreamer = "0.23.2"
+gstreamer-video = "0.23.2"
+gstreamer-audio = "0.23.2"
