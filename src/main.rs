@@ -1,9 +1,15 @@
 #![allow(unused)]
+use base64::prelude::*;
+use std::io::Write;
+
 use futures_util::StreamExt as _;
+use glib::ffi::{g_base64_decode, g_free};
 use gstreamer::{
     prelude::{ElementExt, ElementExtManual, GstBinExtManual, PadExt},
     Caps, Element, ElementFactory, Pipeline,
 };
+use std::ffi::CStr;
+use std::ptr;
 
 const AUDIO_POOLS: usize = 1;
 const AUDIO_MAX_BUFFERS: i32 = 32;
@@ -213,20 +219,18 @@ async fn main() -> Result<(), anyhow::Error> {
         let mut pubsub_stream = pubsub_conn.on_message();
 
         loop {
-            let channel = pubsub_stream
-                .next()
-                .await
-                .unwrap()
-                .get_channel_name()
-                .to_string();
-            let pubsub_msg: String = pubsub_stream.next().await.unwrap().get_payload().unwrap();
-
+            let next = pubsub_stream.next().await.unwrap();
+            let channel: String = next.get_channel().unwrap();
+            let mut pubsub_msg: String = next.get_payload().unwrap();
             if channel == "return-video-feed" {
-                println!("Video received, {}", channel);
+                let mut decoded = BASE64_STANDARD.decode(pubsub_msg.clone()).unwrap();
+                let mut file = std::fs::File::create("output.jpeg").unwrap();
+                file.write_all(&decoded.split_off(15));
+                break;
             }
 
             if channel.starts_with("return-audio-feed") {
-                println!("audio received {}", channel);
+                // println!("audio received {}", channel);
             }
         }
     })

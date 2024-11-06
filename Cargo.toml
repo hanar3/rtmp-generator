@@ -13,3 +13,5 @@ gstreamer-audio = "0.23.2"
 futures-util = "0.3.31"
 redis = { version = "0.27.5", features = ["tokio-comp", "aio"] }
 tokio = { version = "1.41.0", features = ["full"] }
+libc = "0.2.161"
+base64 = "0.22.1"
