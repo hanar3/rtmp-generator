@@ -75,7 +75,7 @@ fn process_video(video: &GstVideo, video_data: &'static mut Vec<u8>) {
     let mut buffer = gstreamer::buffer::Buffer::from_slice(video_data);
 }
 
-fn gst_video(pipeline: &Pipeline, rx: Receiver<Vec<u8>>) -> Result<GstVideo, anyhow::Error> {
+fn gst_video(pipeline: &Pipeline) -> Result<GstVideo, anyhow::Error> {
     let caps = Caps::builder("image/jpeg")
         .field("width", VIDEO_WIDTH)
         .field("height", VIDEO_HEIGHT)
@@ -95,29 +95,6 @@ fn gst_video(pipeline: &Pipeline, rx: Receiver<Vec<u8>>) -> Result<GstVideo, any
     let h264parse = ElementFactory::make("h264parse").build()?;
     let autovideosink = ElementFactory::make("autovideosink").build()?;
 
-    let appsrc = appsrc
-        .dynamic_cast::<gst_app::AppSrc>()
-        .expect("Source element is expected to be an appsrc!");
-
-    appsrc.set_property("format", gstreamer::Format::Time);
-
-    // TODO: retrieve data from redis...?
-    let mut i = 0;
-    appsrc.set_callbacks(
-        gst_app::AppSrcCallbacks::builder()
-            .need_data(move |appsrc, _| {
-                let mut frame = rx.recv().expect("Failed to receive frame");
-                let mut buffer = gstreamer::Buffer::from_slice(frame);
-
-                let _ = appsrc.push_buffer(buffer);
-            })
-            .build(),
-    );
-
-    let appsrc = appsrc
-        .dynamic_cast::<Element>()
-        .expect("Source element is expected to be an appsrc!");
-
     pipeline
         .add_many([
             &appsrc,
@@ -130,7 +107,6 @@ fn gst_video(pipeline: &Pipeline, rx: Receiver<Vec<u8>>) -> Result<GstVideo, any
         ])
         .expect("Failed to add elements to pipeline");
 
-    println!("{:?}", pipeline);
     Element::link_many([
         &appsrc,
         &queue,
@@ -185,13 +161,16 @@ fn gst_audio(pipeline: &Pipeline, id: usize) -> Result<GstAudio, anyhow::Error> 
         .property("latency", 30000000 as u64)
         .build()?;
 
-    pipeline.add_many([
-        &appsrc,
-        &queue,
-        &audioconvert,
-        &convertfilter,
-        &audioresample,
-    ])?;
+    pipeline
+        .add_many([
+            &appsrc,
+            &queue,
+            &audioconvert,
+            &convertfilter,
+            &audioresample,
+            &audiomixer,
+        ])
+        .expect("Failed to add audio elements to pipeline");
 
     Element::link_many([
         &appsrc,
@@ -199,7 +178,8 @@ fn gst_audio(pipeline: &Pipeline, id: usize) -> Result<GstAudio, anyhow::Error> 
         &audioconvert,
         &convertfilter,
         &audioresample,
-    ])?;
+    ])
+    .expect("Failed to link audio elements");
 
     let mixer_pad = audiomixer
         .request_pad_simple("sink_%u")
@@ -219,7 +199,7 @@ fn gst_audio(pipeline: &Pipeline, id: usize) -> Result<GstAudio, anyhow::Error> 
     })
 }
 
-fn setup_gst(rx: Receiver<Vec<u8>>) -> Result<Core, anyhow::Error> {
+fn setup_gst() -> Result<Core, anyhow::Error> {
     gstreamer::init();
     let pipeline = Pipeline::default();
 
@@ -228,12 +208,9 @@ fn setup_gst(rx: Receiver<Vec<u8>>) -> Result<Core, anyhow::Error> {
     let filesink = ElementFactory::make("filesink").build()?;
     let rtmpsink = ElementFactory::make("rtmpsink").build()?;
 
-    let video = gst_video(&pipeline, rx)?;
+    let video = gst_video(&pipeline)?;
 
-    let mut audio = Vec::<GstAudio>::with_capacity(AUDIO_POOLS);
-    for i in 0..AUDIO_POOLS {
-        // audio[i] = gst_audio(&pipeline, i).unwrap();
-    }
+    let mut audio = vec![gst_audio(&pipeline, 0).unwrap()];
 
     Ok(Core {
         pipeline,
@@ -247,7 +224,26 @@ fn setup_gst(rx: Receiver<Vec<u8>>) -> Result<Core, anyhow::Error> {
 }
 
 fn example_main(rx: Receiver<Vec<u8>>) -> Result<(), anyhow::Error> {
-    let core = setup_gst(rx).expect("Failed to setup gst");
+    let core = setup_gst().expect("Failed to setup gst");
+
+    let appsrc = core
+        .video
+        .appsrc
+        .dynamic_cast::<gst_app::AppSrc>()
+        .expect("Source element is expected to be an appsrc!");
+
+    appsrc.set_property("format", gstreamer::Format::Time);
+
+    appsrc.set_callbacks(
+        gst_app::AppSrcCallbacks::builder()
+            .need_data(move |appsrc, _| {
+                if let Ok(mut frame) = rx.recv() {
+                    let mut buffer = gstreamer::Buffer::from_slice(frame);
+                    let _ = appsrc.push_buffer(buffer);
+                }
+            })
+            .build(),
+    );
 
     core.pipeline.set_state(gstreamer::State::Playing);
 
@@ -284,7 +280,6 @@ async fn main() -> Result<(), anyhow::Error> {
         let _: () = pubsub_conn.subscribe(&CHANNELS).await.unwrap();
 
         let mut pubsub_stream = pubsub_conn.on_message();
-        println!("waiting for redis");
         loop {
             let next = pubsub_stream.next().await.unwrap();
             let channel: String = next.get_channel().unwrap();
@@ -292,11 +287,11 @@ async fn main() -> Result<(), anyhow::Error> {
             if channel == "return-video-feed" {
                 let mut decoded = BASE64_STANDARD.decode(pubsub_msg.clone()).unwrap();
                 tx.send(decoded.split_off(15))
-                    .map_err(|err| println!("dropped frame -- reason {}", err));
+                    .map_err(|err| println!("dropped frame -- reason: {}", err));
             }
 
             if channel.starts_with("return-audio-feed") {
-                // println!("audio received {}", channel);
+                println!("audio received {}", channel);
             }
         }
     });
