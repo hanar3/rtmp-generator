@@ -95,15 +95,6 @@ fn gst_video(pipeline: &Pipeline, rx: Receiver<Vec<u8>>) -> Result<GstVideo, any
     let h264parse = ElementFactory::make("h264parse").build()?;
     let autovideosink = ElementFactory::make("autovideosink").build()?;
 
-    let video_info = gstreamer_video::VideoInfo::builder(
-        gstreamer_video::VideoFormat::I420,
-        1280 as u32,
-        720 as u32,
-    )
-    .fps(gstreamer::Fraction::new(30, 1))
-    .build()
-    .expect("Failed to create video info");
-
     let appsrc = appsrc
         .dynamic_cast::<gst_app::AppSrc>()
         .expect("Source element is expected to be an appsrc!");
@@ -300,7 +291,8 @@ async fn main() -> Result<(), anyhow::Error> {
             let mut pubsub_msg: String = next.get_payload().unwrap();
             if channel == "return-video-feed" {
                 let mut decoded = BASE64_STANDARD.decode(pubsub_msg.clone()).unwrap();
-                tx.send(decoded.split_off(15));
+                tx.send(decoded.split_off(15))
+                    .map_err(|err| println!("dropped frame -- reason {}", err));
             }
 
             if channel.starts_with("return-audio-feed") {
@@ -308,7 +300,7 @@ async fn main() -> Result<(), anyhow::Error> {
             }
         }
     });
-    println!("loop?");
+
     main_loop::run(|| {
         example_main(rx);
     });
