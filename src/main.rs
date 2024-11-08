@@ -2,7 +2,7 @@
 extern crate gstreamer_app as gst_app;
 extern crate gstreamer_video;
 use base64::prelude::*;
-use glib::object::Cast;
+use glib::{object::Cast, property::PropertyGet};
 use std::{
     io::Write,
     sync::mpsc::{self, Receiver},
@@ -38,16 +38,16 @@ struct GstAudio {
     audiomixer: Element,
 }
 
-const VIDEO_WIDTH: &str = "1280";
-const VIDEO_HEIGHT: &str = "720";
+const VIDEO_WIDTH: i32 = 1280;
+const VIDEO_HEIGHT: i32 = 720;
 const VIDEO_FPS: &str = "30/1";
 const VIDEO_MAX_BUFFERS: i32 = 10;
-const CHANNELS: [&str; 1] = [
+const CHANNELS: [&str; 5] = [
     "return-video-feed",
-    // "return-audio-feed-1",
-    // "return-audio-feed-2",
-    // "return-audio-feed-3",
-    // "return-audio-feed-5",
+    "return-audio-feed-1",
+    "return-audio-feed-2",
+    "return-audio-feed-3",
+    "return-audio-feed-5",
 ];
 
 struct GstVideo {
@@ -80,6 +80,7 @@ fn gst_video(pipeline: &Pipeline) -> Result<GstVideo, anyhow::Error> {
         .field("width", VIDEO_WIDTH)
         .field("height", VIDEO_HEIGHT)
         .field("colorimetry", "bt601")
+        .field("framerate", "30/1")
         .field("interlace-mode", "progressive")
         .field("chroma-site", "jpeg")
         .build();
@@ -91,9 +92,9 @@ fn gst_video(pipeline: &Pipeline) -> Result<GstVideo, anyhow::Error> {
     let queue = ElementFactory::make("queue").build()?;
     let jpegdec = ElementFactory::make("jpegdec").build()?;
     let videoconvert = ElementFactory::make("videoconvert").build()?;
-    let h264encoder = ElementFactory::make("vtenc_h264").build()?;
+    let h264encoder = ElementFactory::make("avenc_h264_videotoolbox").build()?;
     let h264parse = ElementFactory::make("h264parse").build()?;
-    let autovideosink = ElementFactory::make("autovideosink").build()?;
+    // let autovideosink = ElementFactory::make("autovideosink").build()?;
 
     pipeline
         .add_many([
@@ -101,9 +102,9 @@ fn gst_video(pipeline: &Pipeline) -> Result<GstVideo, anyhow::Error> {
             &queue,
             &jpegdec,
             &videoconvert,
-            //&h264encoder,
-            //&h264parse,
-            &autovideosink,
+            &h264encoder,
+            &h264parse,
+            // &autovideosink,
         ])
         .expect("Failed to add elements to pipeline");
 
@@ -112,9 +113,9 @@ fn gst_video(pipeline: &Pipeline) -> Result<GstVideo, anyhow::Error> {
         &queue,
         &jpegdec,
         &videoconvert,
-        //&h264encoder,
-        //&h264parse,
-        &autovideosink,
+        &h264encoder,
+        &h264parse,
+        //&autovideosink,
     ])
     .expect("Failed to link video elements");
 
@@ -187,7 +188,7 @@ fn gst_audio(pipeline: &Pipeline, id: usize) -> Result<GstAudio, anyhow::Error> 
     let src_pad = audioresample
         .static_pad("src")
         .expect("failed to get static pad");
-    src_pad.link(&mixer_pad)?;
+    src_pad.link(&mixer_pad)?; // audioresampler (src) --> audiomixer (sink)
 
     Ok(GstAudio {
         appsrc,
@@ -204,13 +205,43 @@ fn setup_gst() -> Result<Core, anyhow::Error> {
     let pipeline = Pipeline::default();
 
     let flvmux = ElementFactory::make("flvmux").build()?;
+    flvmux.set_property("streamable", true);
     let muxtee = ElementFactory::make("tee").build()?;
-    let filesink = ElementFactory::make("filesink").build()?;
-    let rtmpsink = ElementFactory::make("rtmpsink").build()?;
-
+    let filesink = ElementFactory::make("filesink")
+        .property("sync", false)
+        .property("async", false)
+        .property("location", "output.flv")
+        .build()?;
+    let rtmpsink = ElementFactory::make("rtmpsink")
+        .property("location", "rtmp://127.0.0.1/live/test")
+        .property("async", false)
+        .property("sync", false)
+        .build()?;
     let video = gst_video(&pipeline)?;
+    let mut audio = vec![];
+    pipeline
+        .add_many([&flvmux, &muxtee, &filesink, &rtmpsink])
+        .expect("Failed to add setup elements to pipeline");
 
-    let mut audio = vec![gst_audio(&pipeline, 0).unwrap()];
+    video
+        .h264parse
+        .static_pad("src")
+        .unwrap()
+        .link(&flvmux.request_pad_simple("video").unwrap())?;
+
+    flvmux.link(&muxtee).expect("Failed to link fvlmux->muxtee");
+
+    muxtee
+        .request_pad_simple("src_%u")
+        .unwrap()
+        .link(&filesink.static_pad("sink").unwrap())?;
+    muxtee
+        .request_pad_simple("src_%u")
+        .unwrap()
+        .link(&rtmpsink.static_pad("sink").unwrap())?;
+
+    pipeline.debug_to_dot_file(gstreamer::DebugGraphDetails::all(), "out");
+    //    Element::link_many([&flvmux, &muxtee, &filesink, &rtmpsink]);
 
     Ok(Core {
         pipeline,
@@ -233,14 +264,16 @@ fn example_main(rx: Receiver<Vec<u8>>) -> Result<(), anyhow::Error> {
         .expect("Source element is expected to be an appsrc!");
 
     appsrc.set_property("format", gstreamer::Format::Time);
+    appsrc.set_property("block", false);
 
     appsrc.set_callbacks(
         gst_app::AppSrcCallbacks::builder()
             .need_data(move |appsrc, _| {
+                let mut pts = 0;
                 if let Ok(mut frame) = rx.recv() {
                     let mut buffer = gstreamer::Buffer::from_slice(frame);
                     let _ = appsrc.push_buffer(buffer);
-                }
+                };
             })
             .build(),
     );
@@ -291,7 +324,8 @@ async fn main() -> Result<(), anyhow::Error> {
             }
 
             if channel.starts_with("return-audio-feed") {
-                println!("audio received {}", channel);
+                let audio_id = channel.chars().last().unwrap();
+                // println!("audio received {}", channel);
             }
         }
     });
