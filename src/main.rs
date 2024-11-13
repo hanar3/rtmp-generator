@@ -48,19 +48,40 @@ struct Core {
     rtmpsink: Element,
 }
 
-const LAUNCH_STR: &str = concat!(
-    "flvmux name=muxer streamable=1 latency=300000000 ! tee name=splitter ! queue max-size-buffers=10 leaky=2 ! rtmp2sink name=rtmp sync=0 async=0",
-    " appsrc name=video_src format=3 block=0 is-live=1 ! image/jpeg,width=1280,height=720,framerate=30/1,colorimetry=bt601,chroma-site=jpeg",
-    " ! queue max-size-buffers=2 ! jpegdec ! videoscale ! video/x-raw,width=1280,height=720 ! videoconvert ! nvh264enc preset=4 rc-mode=2 zerolatency=1 bitrate=3500 ! h264parse ! muxer.video",
-    " appsrc name=audio_src format=3 block=0 is-live=1 ! audio/x-raw,rate=48000,format=S16LE,layout=interleaved,channels=1",
-    " ! queue max-size-buffers=2 ! audioconvert ! audio/x-raw,layout=interleaved ! audioresample ! audio/x-raw,rate=44100 ! fdkaacenc bitrate=128000 ! aacparse ! muxer.audio",
+#[cfg(target_os = "linux")]
+const H264_ENCODER: &str = "nvh264enc preset=4 rc-mode=2 zerolatency=1 bitrate=3500";
+
+#[cfg(target_os = "macos")]
+const H264_ENCODER: &str = "vtenc_h264 realtime=true allow-frame-reordering=false bitrate=3500";
+
+#[cfg(target_os = "linux")]
+const AUDIO_ENCODER: &str = "fdkaacenc bitrate=128000";
+
+#[cfg(target_os = "macos")]
+const AUDIO_ENCODER: &str = "avenc_aac bitrate=128000";
+
+const OUTPUT_STR: &str = concat!(
+    "flvmux name=muxer streamable=1 latency=300000000 skip-backwards-streams=true ! tee name=splitter ! queue max-size-buffers=10 leaky=2 ! rtmp2sink name=rtmp sync=0 async=0",
     " splitter. ! queue max-size-buffers=10 leaky=2 ! filesink name=file sync=0 location=trash/output.flv",
+);
+
+const VIDEO_DECODE_STR: &str = concat!(
+    "appsrc name=video_src format=3 block=0 is-live=1",
+    " ! image/jpeg,width=1280,height=720,framerate=30/1,colorimetry=bt601,chroma-site=jpeg ! queue max-size-buffers=2",
+    " ! jpegdec ! videoscale ! video/x-raw,width=1280,height=720 ! videoconvert"
+);
+const AUDIO_DECODE_STR: &str = concat!(
+    "appsrc name=audio_src format=3 block=0 is-live=1",
+    " ! audio/x-raw,rate=48000,format=S16LE,layout=interleaved,channels=1",
+    " ! queue max-size-buffers=2 ! audioconvert ! audio/x-raw,layout=interleaved ! audioresample ! audio/x-raw,rate=44100"
 );
 
 fn setup_gst() -> Result<Core, anyhow::Error> {
     gstreamer::init();
+    let launch_str = format!("{OUTPUT_STR} {VIDEO_DECODE_STR} ! {H264_ENCODER} ! h264parse ! muxer.video {AUDIO_DECODE_STR} ! {AUDIO_ENCODER} ! aacparse ! muxer.audio");
+    println!("Pipeline: {launch_str}");
 
-    let pipeline = gst::parse::launch(LAUNCH_STR)
+    let pipeline = gst::parse::launch(launch_str.as_str())
         .expect("Failed to create pipeline")
         .downcast::<Pipeline>()
         .expect("Failed to downcast to pipeline");
