@@ -2,8 +2,11 @@
 extern crate gstreamer_app as gst_app;
 extern crate gstreamer_video;
 use base64::prelude::*;
-use glib::{object::Cast, property::PropertyGet};
+use glib::{ffi::GError, object::Cast, property::PropertyGet};
+use gst_app::prelude::GstBinExt;
+use gstreamer::{self as gst, Bin};
 use std::{
+    ffi::CString,
     io::Write,
     sync::mpsc::{self, Receiver},
 };
@@ -14,7 +17,7 @@ use glib::{
     object::ObjectExt,
 };
 use gstreamer::{
-    ffi::gst_buffer_new_wrapped_full,
+    ffi::{gst_buffer_new_wrapped_full, gst_parse_launch, GstElement},
     prelude::{ElementExt, ElementExtManual, GstBinExtManual, PadExt},
     Caps, Element, ElementFactory, Pipeline,
 };
@@ -29,248 +32,87 @@ const AUDIO_INPUT_INTERLEAVED: gstreamer_audio::AudioLayout =
     gstreamer_audio::AudioLayout::Interleaved;
 // const REDIS_AUDIO_FEEDS[AUDIO_POOLS];
 
-struct GstAudio {
-    appsrc: Element,
-    queue: Element,
-    audioconvert: Element,
-    convertfilter: Element,
-    audioresample: Element,
-    audiomixer: Element,
-}
-
 const VIDEO_WIDTH: i32 = 1280;
 const VIDEO_HEIGHT: i32 = 720;
 const VIDEO_FPS: &str = "30/1";
 const VIDEO_MAX_BUFFERS: i32 = 10;
-const CHANNELS: [&str; 5] = [
-    "return-video-feed",
-    "return-audio-feed-1",
-    "return-audio-feed-2",
-    "return-audio-feed-3",
-    "return-audio-feed-5",
-];
-
-struct GstVideo {
-    appsrc: Element,
-    queue: Element,
-    jpegdec: Element,
-    videoconvert: Element,
-    h264encoder: Element,
-    h264parse: Element,
-}
+const CHANNELS: [&str; 1] = ["return-audio-feed-5"];
 
 struct Core {
     pipeline: Pipeline,
-    video: GstVideo,
-    audio: Vec<GstAudio>,
-    flvmux: Element,
+    // audio: Vec<Element>,
+    audio: Element,
+    video: Element,
     muxtee: Element,
     filesink: Element,
     rtmpsink: Element,
 }
 
-fn handle_video() {}
-
-fn process_video(video: &GstVideo, video_data: &'static mut Vec<u8>) {
-    let mut buffer = gstreamer::buffer::Buffer::from_slice(video_data);
-}
-
-fn gst_video(pipeline: &Pipeline) -> Result<GstVideo, anyhow::Error> {
-    let caps = Caps::builder("image/jpeg")
-        .field("width", VIDEO_WIDTH)
-        .field("height", VIDEO_HEIGHT)
-        .field("colorimetry", "bt601")
-        .field("framerate", "30/1")
-        .field("interlace-mode", "progressive")
-        .field("chroma-site", "jpeg")
-        .build();
-
-    let appsrc = ElementFactory::make("appsrc")
-        .name("video")
-        .property("caps", &caps)
-        .build()?;
-    let queue = ElementFactory::make("queue").build()?;
-    let jpegdec = ElementFactory::make("jpegdec").build()?;
-    let videoconvert = ElementFactory::make("videoconvert").build()?;
-    let h264encoder = ElementFactory::make("avenc_h264_videotoolbox").build()?;
-    let h264parse = ElementFactory::make("h264parse").build()?;
-    // let autovideosink = ElementFactory::make("autovideosink").build()?;
-
-    pipeline
-        .add_many([
-            &appsrc,
-            &queue,
-            &jpegdec,
-            &videoconvert,
-            &h264encoder,
-            &h264parse,
-            // &autovideosink,
-        ])
-        .expect("Failed to add elements to pipeline");
-
-    Element::link_many([
-        &appsrc,
-        &queue,
-        &jpegdec,
-        &videoconvert,
-        &h264encoder,
-        &h264parse,
-        //&autovideosink,
-    ])
-    .expect("Failed to link video elements");
-
-    Ok(GstVideo {
-        appsrc,
-        queue,
-        jpegdec,
-        videoconvert,
-        h264encoder,
-        h264parse,
-    })
-}
-
-fn handle_audio() {}
-
-fn process_audio(id: usize) {}
-
-fn gst_audio(pipeline: &Pipeline, id: usize) -> Result<GstAudio, anyhow::Error> {
-    // let audio = &mut core.audio[id];
-    let queue = ElementFactory::make("queue").build()?;
-    let audioconvert = ElementFactory::make("audioconvert").build()?;
-    let audioresample = ElementFactory::make("audioresample").build()?;
-
-    let convert_caps = gstreamer_audio::AudioCapsBuilder::new()
-        .channels(1)
-        .format(AUDIO_FORMAT)
-        .layout(AUDIO_INPUT_INTERLEAVED)
-        .build();
-    let convertfilter = ElementFactory::make("capsfilter")
-        .property("caps", &convert_caps)
-        .build()?;
-
-    let src_caps = gstreamer_audio::AudioCapsBuilder::new()
-        .channels(1)
-        .format(gstreamer_audio::AudioFormat::S16le)
-        .layout(gstreamer_audio::AudioLayout::Interleaved)
-        .build();
-    let appsrc = ElementFactory::make("appsrc")
-        .name(format!("audio{}", id))
-        .property("caps", &src_caps)
-        .build()?;
-
-    let audiomixer = ElementFactory::make("audiomixer")
-        .property("latency", 30000000 as u64)
-        .build()?;
-
-    pipeline
-        .add_many([
-            &appsrc,
-            &queue,
-            &audioconvert,
-            &convertfilter,
-            &audioresample,
-            &audiomixer,
-        ])
-        .expect("Failed to add audio elements to pipeline");
-
-    Element::link_many([
-        &appsrc,
-        &queue,
-        &audioconvert,
-        &convertfilter,
-        &audioresample,
-    ])
-    .expect("Failed to link audio elements");
-
-    let mixer_pad = audiomixer
-        .request_pad_simple("sink_%u")
-        .expect("Failed to request sink pad");
-    let src_pad = audioresample
-        .static_pad("src")
-        .expect("failed to get static pad");
-    src_pad.link(&mixer_pad)?; // audioresampler (src) --> audiomixer (sink)
-
-    Ok(GstAudio {
-        appsrc,
-        queue,
-        audioconvert,
-        audioresample,
-        convertfilter,
-        audiomixer,
-    })
-}
+const LAUNCH_STR: &str = concat!(
+    "flvmux name=muxer streamable=1 latency=300000000 ! tee name=splitter ! queue max-size-buffers=10 leaky=2 ! rtmp2sink name=rtmp sync=0 async=0",
+    " appsrc name=video_src format=3 block=0 is-live=1 ! image/jpeg,width=1280,height=720,framerate=30/1,colorimetry=bt601,chroma-site=jpeg",
+    " ! queue max-size-buffers=2 ! jpegdec ! videoscale ! video/x-raw,width=1280,height=720 ! videoconvert ! nvh264enc preset=4 rc-mode=2 zerolatency=1 bitrate=3500 ! h264parse ! muxer.video",
+    " appsrc name=audio_src format=3 block=0 is-live=1 ! audio/x-raw,rate=48000,format=S16LE,layout=interleaved,channels=1",
+    " ! queue max-size-buffers=2 ! audioconvert ! audio/x-raw,layout=interleaved ! audioresample ! audio/x-raw,rate=44100 ! fdkaacenc bitrate=128000 ! aacparse ! muxer.audio",
+    " splitter. ! queue max-size-buffers=10 leaky=2 ! filesink name=file sync=0 location=trash/output.flv",
+);
 
 fn setup_gst() -> Result<Core, anyhow::Error> {
     gstreamer::init();
-    let pipeline = Pipeline::default();
 
-    let flvmux = ElementFactory::make("flvmux").build()?;
-    flvmux.set_property("streamable", true);
-    let muxtee = ElementFactory::make("tee").build()?;
-    let filesink = ElementFactory::make("filesink")
-        .property("sync", false)
-        .property("async", false)
-        .property("location", "output.flv")
-        .build()?;
-    let rtmpsink = ElementFactory::make("rtmpsink")
-        .property("location", "rtmp://127.0.0.1/live/test")
-        .property("async", false)
-        .property("sync", false)
-        .build()?;
-    let video = gst_video(&pipeline)?;
-    let mut audio = vec![];
-    pipeline
-        .add_many([&flvmux, &muxtee, &filesink, &rtmpsink])
-        .expect("Failed to add setup elements to pipeline");
-
-    video
-        .h264parse
-        .static_pad("src")
-        .unwrap()
-        .link(&flvmux.request_pad_simple("video").unwrap())?;
-
-    flvmux.link(&muxtee).expect("Failed to link fvlmux->muxtee");
-
-    muxtee
-        .request_pad_simple("src_%u")
-        .unwrap()
-        .link(&filesink.static_pad("sink").unwrap())?;
-    muxtee
-        .request_pad_simple("src_%u")
-        .unwrap()
-        .link(&rtmpsink.static_pad("sink").unwrap())?;
-
-    pipeline.debug_to_dot_file(gstreamer::DebugGraphDetails::all(), "out");
-    //    Element::link_many([&flvmux, &muxtee, &filesink, &rtmpsink]);
+    let pipeline = gst::parse::launch(LAUNCH_STR)
+        .expect("Failed to create pipeline")
+        .downcast::<Pipeline>()
+        .expect("Failed to downcast to pipeline");
+    let audio = pipeline.by_name("audio_src").unwrap();
+    let video = pipeline.by_name("video_src").unwrap();
+    let muxtee = pipeline.by_name("splitter").unwrap();
+    let filesink = pipeline.by_name("file").unwrap();
+    let rtmpsink = pipeline.by_name("rtmp").unwrap();
+    rtmpsink.set_property("location", "rtmp://127.0.0.1/live/test");
 
     Ok(Core {
         pipeline,
         audio,
-        filesink,
-        flvmux,
-        muxtee,
-        rtmpsink,
         video,
+        muxtee,
+        filesink,
+        rtmpsink,
     })
 }
 
-fn example_main(rx: Receiver<Vec<u8>>) -> Result<(), anyhow::Error> {
+fn example_main(
+    videorx: Receiver<Vec<u8>>,
+    audiorx: Receiver<Vec<u8>>,
+) -> Result<(), anyhow::Error> {
     let core = setup_gst().expect("Failed to setup gst");
 
-    let appsrc = core
+    let videosrc = core
         .video
-        .appsrc
         .dynamic_cast::<gst_app::AppSrc>()
-        .expect("Source element is expected to be an appsrc!");
+        .expect("Video element is expected to be an appsrc!");
+    let audiosrc = core
+        .audio
+        .dynamic_cast::<gst_app::AppSrc>()
+        .expect("Audio element is expected to be an appsrc!");
 
-    appsrc.set_property("format", gstreamer::Format::Time);
-    appsrc.set_property("block", false);
-
-    appsrc.set_callbacks(
+    videosrc.set_callbacks(
         gst_app::AppSrcCallbacks::builder()
             .need_data(move |appsrc, _| {
                 let mut pts = 0;
-                if let Ok(mut frame) = rx.recv() {
+                if let Ok(mut frame) = videorx.recv() {
+                    let mut buffer = gstreamer::Buffer::from_slice(frame);
+                    let _ = appsrc.push_buffer(buffer);
+                };
+            })
+            .build(),
+    );
+
+    audiosrc.set_callbacks(
+        gst_app::AppSrcCallbacks::builder()
+            .need_data(move |appsrc, _| {
+                let mut pts = 0;
+                if let Ok(mut frame) = audiorx.recv() {
                     let mut buffer = gstreamer::Buffer::from_slice(frame);
                     let _ = appsrc.push_buffer(buffer);
                 };
@@ -303,35 +145,48 @@ fn example_main(rx: Receiver<Vec<u8>>) -> Result<(), anyhow::Error> {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (videotx, videorx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (audiotx, audiorx) = std::sync::mpsc::channel::<Vec<u8>>();
 
     let _ = tokio::spawn(async move {
         let client = redis::Client::open("redis://127.0.0.1/").unwrap();
         let mut pubsub_conn = client.get_async_pubsub().await.unwrap();
+        println!("Connected to redis");
 
-        // let _: () = pubsub_conn.subscribe("return-video-feed").await.unwrap();
+        let _: () = pubsub_conn.subscribe("return-video-feed").await.unwrap();
         let _: () = pubsub_conn.subscribe(&CHANNELS).await.unwrap();
+        println!("Subscribed to channels");
 
         let mut pubsub_stream = pubsub_conn.on_message();
         loop {
             let next = pubsub_stream.next().await.unwrap();
             let channel: String = next.get_channel().unwrap();
+            println!(
+                "Received message: channel({}) size({})",
+                channel,
+                next.get_payload_bytes().len()
+            );
             let mut pubsub_msg: String = next.get_payload().unwrap();
             if channel == "return-video-feed" {
                 let mut decoded = BASE64_STANDARD.decode(pubsub_msg.clone()).unwrap();
-                tx.send(decoded.split_off(15))
+                let fixed = decoded.split_off(15);
+                videotx
+                    .send(fixed)
                     .map_err(|err| println!("dropped frame -- reason: {}", err));
             }
 
             if channel.starts_with("return-audio-feed") {
                 let audio_id = channel.chars().last().unwrap();
-                // println!("audio received {}", channel);
+                let decoded = BASE64_STANDARD.decode(pubsub_msg.clone()).unwrap();
+                audiotx
+                    .send(decoded)
+                    .map_err(|err| println!("dropped audio sample -- reason: {}", err));
             }
         }
     });
 
     main_loop::run(|| {
-        example_main(rx);
+        example_main(videorx, audiorx);
     });
 
     Ok(())
