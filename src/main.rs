@@ -4,12 +4,15 @@ extern crate gstreamer_video;
 use base64::prelude::*;
 use glib::{ffi::GError, object::Cast, property::PropertyGet};
 use gst_app::prelude::GstBinExt;
-use gstreamer::{self as gst, Bin};
+use gstreamer::{self as gst, Bin, ClockTime};
+use image::{codecs::jpeg::JpegEncoder, ImageBuffer};
 use std::{
     ffi::CString,
     io::Write,
     sync::mpsc::{self, Receiver},
+    time::Duration,
 };
+use tokio::time::sleep;
 
 use futures_util::StreamExt as _;
 use glib::{
@@ -102,6 +105,15 @@ fn setup_gst() -> Result<Core, anyhow::Error> {
     })
 }
 
+fn create_empty_jpeg(width: u32, height: u32) -> Vec<u8> {
+    let img = ImageBuffer::from_pixel(width, height, image::Rgb::<u8>([0, 0, 0]));
+    let mut jpeg_data = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_data, 90);
+    encoder.encode_image(&img).expect("Failed to encode JPEG");
+
+    jpeg_data
+}
+
 fn example_main(
     videorx: Receiver<Vec<u8>>,
     audiorx: Receiver<Vec<u8>>,
@@ -117,26 +129,64 @@ fn example_main(
         .dynamic_cast::<gst_app::AppSrc>()
         .expect("Audio element is expected to be an appsrc!");
 
+    let mut video_pts = 0;
+    let mut video_duration = ClockTime::from_seconds(1) / 30;
+    let empty_jpeg = create_empty_jpeg(1280, 720);
+    let mut last_frame: Vec<u8> = vec![0; 0];
     videosrc.set_callbacks(
         gst_app::AppSrcCallbacks::builder()
             .need_data(move |appsrc, _| {
-                let mut pts = 0;
-                if let Ok(mut frame) = videorx.recv() {
-                    let mut buffer = gstreamer::Buffer::from_slice(frame);
-                    let _ = appsrc.push_buffer(buffer);
+                let frame: Vec<u8>;
+                if let Ok(mut in_frame) = videorx.recv_timeout(Duration::from(video_duration) + Duration::from_millis(5)) {
+                    // println!("Video duration: {:.4}ms", duration.seconds_f32() * 1000.0);
+                    frame = in_frame;
+                } else {
+                    println!("Missing video!");
+                    if last_frame.len() > 0 {
+                        frame = last_frame.clone();
+                    } else {
+                        frame = empty_jpeg.clone();
+                    }
                 };
+
+                last_frame = frame.clone();
+                let mut buffer = gstreamer::Buffer::from_slice(frame);
+                buffer.get_mut().unwrap().set_duration(video_duration);
+                video_pts += video_duration.useconds();
+                let _ = appsrc.push_buffer(buffer);
             })
             .build(),
     );
 
+    let mut audio_pts = 0;
+    let mut audio_duration: ClockTime = ClockTime::from_nseconds(23333333);
+    let mut last_audio = std::time::SystemTime::now();
     audiosrc.set_callbacks(
         gst_app::AppSrcCallbacks::builder()
             .need_data(move |appsrc, _| {
-                let mut pts = 0;
-                if let Ok(mut frame) = audiorx.recv() {
-                    let mut buffer = gstreamer::Buffer::from_slice(frame);
-                    let _ = appsrc.push_buffer(buffer);
+                let mut buffer: gstreamer::Buffer;
+                let mut sample: Vec<u8>;
+                let now = std::time::SystemTime::now();
+                if let Ok(mut in_sample) = audiorx.recv_timeout(Duration::from(audio_duration) + Duration::from_millis(5)) {
+                    sample = in_sample;
+                } else {
+                    println!("Missing audio!");
+                    sample = vec![0 as u8; 2048];
                 };
+                
+
+                audio_duration = ((sample.len() as u64 / 2) * ClockTime::from_seconds(1)) / 48000;
+                println!(
+                    "Audio duration: {} {:.4}ms {:?}",
+                    sample.len(),
+                    audio_duration.seconds_f32() * 1000.0,
+                    now.duration_since(last_audio).unwrap()
+                );
+                last_audio = now;
+                let mut buffer = gstreamer::Buffer::from_slice(sample);
+                buffer.get_mut().unwrap().set_duration(audio_duration);
+                audio_pts += audio_duration.useconds();
+                let _ = appsrc.push_buffer(buffer);
             })
             .build(),
     );
@@ -150,6 +200,16 @@ fn example_main(
 
     for msg in bus.iter_timed(gstreamer::ClockTime::NONE) {
         use gstreamer::MessageView;
+
+        if audio_duration > video_duration && (audio_duration - video_duration).mseconds() > 100 {
+            println!("Video too far behind. Synchronizing");
+            video_duration = audio_duration;
+        }
+
+        if video_duration > audio_duration && (video_duration - audio_duration).mseconds() > 100 {
+            println!("Audio too far behind. Synchronizing");
+            audio_duration = video_duration;
+        }
 
         match msg.view() {
             MessageView::Eos(..) => break,
@@ -182,11 +242,11 @@ async fn main() -> Result<(), anyhow::Error> {
         loop {
             let next = pubsub_stream.next().await.unwrap();
             let channel: String = next.get_channel().unwrap();
-            println!(
-                "Received message: channel({}) size({})",
-                channel,
-                next.get_payload_bytes().len()
-            );
+            // println!(
+            //     "Received message: channel({}) size({})",
+            //     channel,
+            //     next.get_payload_bytes().len()
+            // );
             let mut pubsub_msg: String = next.get_payload().unwrap();
             if channel == "return-video-feed" {
                 let mut decoded = BASE64_STANDARD.decode(pubsub_msg.clone()).unwrap();
