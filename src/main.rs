@@ -133,11 +133,15 @@ fn example_main(
     let mut video_duration = ClockTime::from_seconds(1) / 30;
     let empty_jpeg = create_empty_jpeg(1280, 720);
     let mut last_frame: Vec<u8> = vec![0; 0];
+    let mut last_video = std::time::SystemTime::now();
     videosrc.set_callbacks(
         gst_app::AppSrcCallbacks::builder()
             .need_data(move |appsrc, _| {
                 let frame: Vec<u8>;
-                if let Ok(mut in_frame) = videorx.recv_timeout(Duration::from(video_duration) + Duration::from_millis(5)) {
+                let now = std::time::SystemTime::now();
+                if let Ok(mut in_frame) =
+                    videorx.recv_timeout(Duration::from(video_duration) + Duration::from_millis(5))
+                {
                     // println!("Video duration: {:.4}ms", duration.seconds_f32() * 1000.0);
                     frame = in_frame;
                 } else {
@@ -149,11 +153,24 @@ fn example_main(
                     }
                 };
 
+                println!(
+                    "Video duration: {} {:.4}ms {:?}",
+                    frame.len(),
+                    video_duration.seconds_f32() * 1000.0,
+                    now.duration_since(last_video)
+                        .expect("video: Wrong time order")
+                );
+
                 last_frame = frame.clone();
                 let mut buffer = gstreamer::Buffer::from_slice(frame);
-                buffer.get_mut().unwrap().set_duration(video_duration);
+                buffer
+                    .get_mut()
+                    .expect("video: Failed to get mut buffer")
+                    .set_duration(video_duration);
                 video_pts += video_duration.useconds();
-                let _ = appsrc.push_buffer(buffer);
+                appsrc
+                    .push_buffer(buffer)
+                    .expect("video: Failed to push buffer");
             })
             .build(),
     );
@@ -167,26 +184,33 @@ fn example_main(
                 let mut buffer: gstreamer::Buffer;
                 let mut sample: Vec<u8>;
                 let now = std::time::SystemTime::now();
-                if let Ok(mut in_sample) = audiorx.recv_timeout(Duration::from(audio_duration) + Duration::from_millis(5)) {
+                if let Ok(mut in_sample) =
+                    audiorx.recv_timeout(Duration::from(audio_duration) + Duration::from_millis(5))
+                {
                     sample = in_sample;
                 } else {
                     println!("Missing audio!");
                     sample = vec![0 as u8; 2048];
                 };
-                
 
                 audio_duration = ((sample.len() as u64 / 2) * ClockTime::from_seconds(1)) / 48000;
                 println!(
                     "Audio duration: {} {:.4}ms {:?}",
                     sample.len(),
                     audio_duration.seconds_f32() * 1000.0,
-                    now.duration_since(last_audio).unwrap()
+                    now.duration_since(last_audio)
+                        .expect("audio: Wrong time order"),
                 );
                 last_audio = now;
                 let mut buffer = gstreamer::Buffer::from_slice(sample);
-                buffer.get_mut().unwrap().set_duration(audio_duration);
+                buffer
+                    .get_mut()
+                    .expect("audio: Failed to get mut buffer")
+                    .set_duration(audio_duration);
                 audio_pts += audio_duration.useconds();
-                let _ = appsrc.push_buffer(buffer);
+                appsrc
+                    .push_buffer(buffer)
+                    .expect("audio: Failed to push buffer");
             })
             .build(),
     );
